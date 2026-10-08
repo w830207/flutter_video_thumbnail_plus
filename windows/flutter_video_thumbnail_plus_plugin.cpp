@@ -19,12 +19,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef min
@@ -35,6 +40,13 @@
 #endif
 
 namespace flutter_video_thumbnail_plus {
+
+struct TaskQueue {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<std::function<void()>> tasks;
+  bool stopping = false;
+};
 
 namespace {
 
@@ -418,17 +430,84 @@ std::wstring BuildOutputPath(const std::wstring& video_path, const std::optional
   return (temp_dir / base_name).replace_extension(extension).wstring();
 }
 
+constexpr int kWorkerCount = 2;
+
+// Window message used to hop from a worker thread back to the platform thread.
+UINT TaskCompleteMessage() {
+  static const UINT message = RegisterWindowMessageW(L"FlutterVideoThumbnailPlusTaskComplete");
+  return message;
+}
+
+// Runs |callback| on the platform thread, where MethodResult must be completed.
+// If the window is already gone (app shutting down) the callback is dropped.
+void PostToPlatformThread(HWND window, std::function<void()> callback) {
+  auto* payload = new std::function<void()>(std::move(callback));
+  if (window == nullptr || !PostMessageW(window, TaskCompleteMessage(), 0, reinterpret_cast<LPARAM>(payload))) {
+    delete payload;
+  }
+}
+
+void WorkerLoop(std::shared_ptr<TaskQueue> queue) {
+  // Media Foundation and WIC need COM/MF initialized on every thread that uses them.
+  const HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  MFStartup(MF_VERSION);
+
+  while (true) {
+    std::function<void()> task;
+    {
+      std::unique_lock<std::mutex> lock(queue->mutex);
+      queue->cv.wait(lock, [&queue] { return queue->stopping || !queue->tasks.empty(); });
+      if (queue->stopping) {
+        break;
+      }
+      task = std::move(queue->tasks.front());
+      queue->tasks.pop_front();
+    }
+    task();
+  }
+
+  MFShutdown();
+  if (SUCCEEDED(co_hr)) {
+    CoUninitialize();
+  }
+}
+
 }  // namespace
 
-FlutterVideoThumbnailPlusPlugin::FlutterVideoThumbnailPlusPlugin() { MFStartup(MF_VERSION); }
+FlutterVideoThumbnailPlusPlugin::FlutterVideoThumbnailPlusPlugin(flutter::PluginRegistrarWindows* registrar)
+    : registrar_(registrar), queue_(std::make_shared<TaskQueue>()) {
+  window_proc_id_ = registrar_->RegisterTopLevelWindowProcDelegate(
+      [](HWND, UINT message, WPARAM, LPARAM lparam) -> std::optional<LRESULT> {
+        if (message != TaskCompleteMessage()) {
+          return std::nullopt;
+        }
+        std::unique_ptr<std::function<void()>> callback(reinterpret_cast<std::function<void()>*>(lparam));
+        (*callback)();
+        return 0;
+      });
 
-FlutterVideoThumbnailPlusPlugin::~FlutterVideoThumbnailPlusPlugin() { MFShutdown(); }
+  // Workers are detached and only hold the shared queue, so shutting down never
+  // waits on a slow network read inside Media Foundation.
+  for (int i = 0; i < kWorkerCount; ++i) {
+    std::thread(WorkerLoop, queue_).detach();
+  }
+}
+
+FlutterVideoThumbnailPlusPlugin::~FlutterVideoThumbnailPlusPlugin() {
+  {
+    std::lock_guard<std::mutex> lock(queue_->mutex);
+    queue_->stopping = true;
+    queue_->tasks.clear();
+  }
+  queue_->cv.notify_all();
+  registrar_->UnregisterTopLevelWindowProcDelegate(window_proc_id_);
+}
 
 void FlutterVideoThumbnailPlusPlugin::RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar) {
   auto channel = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
       registrar->messenger(), "flutter_video_thumbnail_plus", &flutter::StandardMethodCodec::GetInstance());
 
-  auto plugin = std::make_unique<FlutterVideoThumbnailPlusPlugin>();
+  auto plugin = std::make_unique<FlutterVideoThumbnailPlusPlugin>(registrar);
 
   channel->SetMethodCallHandler(
       [plugin_pointer = plugin.get()](const auto& call, auto result) { plugin_pointer->HandleMethodCall(call, std::move(result)); });
@@ -439,6 +518,12 @@ void FlutterVideoThumbnailPlusPlugin::RegisterWithRegistrar(flutter::PluginRegis
 void FlutterVideoThumbnailPlusPlugin::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue>& method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  const std::string method = method_call.method_name();
+  if (method != "data" && method != "file") {
+    result->NotImplemented();
+    return;
+  }
+
   if (method_call.arguments() == nullptr || !std::holds_alternative<EncodableMap>(*method_call.arguments())) {
     result->Error("invalid_arguments", "Expected a map for method arguments.");
     return;
@@ -458,36 +543,56 @@ void FlutterVideoThumbnailPlusPlugin::HandleMethodCall(
   const int quality = static_cast<int>(GetIntArg(args, "quality", 10));
   const auto path_arg = GetStringArg(args, "path");
 
-  std::string error_message;
-  const auto bytes =
-      GenerateThumbnailData(Utf8ToWide(*video_arg), format, maxh, maxw, time_ms, quality, &error_message);
-  if (!bytes.has_value()) {
-    result->Error("thumbnail_error", error_message);
+  // Resolve the top-level window here, on the platform thread, so workers can post back to it.
+  flutter::FlutterView* view = registrar_->GetView();
+  HWND window = view != nullptr ? GetAncestor(view->GetNativeWindow(), GA_ROOT) : nullptr;
+  if (window == nullptr) {
+    result->Error("thumbnail_error", "No Flutter window available.");
     return;
   }
 
-  if (method_call.method_name().compare("data") == 0) {
-    result->Success(EncodableValue(*bytes));
-    return;
-  }
+  std::shared_ptr<flutter::MethodResult<EncodableValue>> shared_result(std::move(result));
+  auto task = [shared_result, window, method, video = Utf8ToWide(*video_arg), path_arg, format, maxh, maxw, time_ms,
+               quality]() {
+    std::string error_message;
+    auto bytes = GenerateThumbnailData(video, format, maxh, maxw, time_ms, quality, &error_message);
+    if (!bytes.has_value()) {
+      PostToPlatformThread(window, [shared_result, error_message] {
+        shared_result->Error("thumbnail_error", error_message);
+      });
+      return;
+    }
 
-  if (method_call.method_name().compare("file") == 0) {
-    const std::wstring output_path = BuildOutputPath(Utf8ToWide(*video_arg), path_arg, format);
+    if (method == "data") {
+      PostToPlatformThread(window, [shared_result, data = std::move(*bytes)] {
+        shared_result->Success(EncodableValue(data));
+      });
+      return;
+    }
+
+    const std::wstring output_path = BuildOutputPath(video, path_arg, format);
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(output_path).parent_path(), ec);
     FILE* file = nullptr;
     _wfopen_s(&file, output_path.c_str(), L"wb");
     if (file == nullptr) {
-      result->Error("thumbnail_error", "Cannot open output file for writing.");
+      PostToPlatformThread(window, [shared_result] {
+        shared_result->Error("thumbnail_error", "Cannot open output file for writing.");
+      });
       return;
     }
     fwrite(bytes->data(), sizeof(uint8_t), bytes->size(), file);
     fclose(file);
-    result->Success(EncodableValue(WideToUtf8(output_path)));
-    return;
-  }
+    PostToPlatformThread(window, [shared_result, path = WideToUtf8(output_path)] {
+      shared_result->Success(EncodableValue(path));
+    });
+  };
 
-  result->NotImplemented();
+  {
+    std::lock_guard<std::mutex> lock(queue_->mutex);
+    queue_->tasks.push_back(std::move(task));
+  }
+  queue_->cv.notify_one();
 }
 
 }  // namespace flutter_video_thumbnail_plus

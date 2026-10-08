@@ -8,11 +8,13 @@
 
 namespace flutter_video_thumbnail_plus {
 
+struct TaskQueue;
+
 class FlutterVideoThumbnailPlusPlugin : public flutter::Plugin {
  public:
   static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
 
-  FlutterVideoThumbnailPlusPlugin();
+  explicit FlutterVideoThumbnailPlusPlugin(flutter::PluginRegistrarWindows* registrar);
   ~FlutterVideoThumbnailPlusPlugin() override;
 
   FlutterVideoThumbnailPlusPlugin(const FlutterVideoThumbnailPlusPlugin&) = delete;
@@ -22,6 +24,13 @@ class FlutterVideoThumbnailPlusPlugin : public flutter::Plugin {
   void HandleMethodCall(
       const flutter::MethodCall<flutter::EncodableValue>& method_call,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+
+  flutter::PluginRegistrarWindows* registrar_;
+  int window_proc_id_ = -1;
+
+  // Thumbnail generation runs on worker threads so Media Foundation (which may
+  // download the video over the network) never blocks the platform/UI thread.
+  std::shared_ptr<TaskQueue> queue_;
 };
 
 }  // namespace flutter_video_thumbnail_plus
